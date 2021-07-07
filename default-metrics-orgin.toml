@@ -1,0 +1,41 @@
+[[metric]]
+context = "sessions"
+labels = [ "status", "type" ]
+metricsdesc = { value= "Gauge metric with count of sessions by status and type." }
+request = "sessions.sql"
+
+[[metric]]
+context = "resource"
+labels = [ "resource_name" ]
+metricsdesc = { current_utilization= "Generic counter metric from v$resource_limit view in Oracle (current value).", limit_value="Generic counter metric from v$resource_limit view in Oracle (UNLIMITED: -1)." }
+request="resource.sql"
+
+[[metric]]
+context = "asm_diskgroup"
+labels = [ "name" ]
+metricsdesc = { total = "Total size of ASM disk group.", free = "Free space available on ASM disk group." }
+request = "asm_diskgroup.sql"
+ignorezeroresult = true
+
+[[metric]]
+context = "activity"
+metricsdesc = { value="Generic counter metric from v$sysstat view in Oracle." }
+fieldtoappend = "name"
+request = "activity.sql"
+
+[[metric]]
+context = "process"
+metricsdesc = { count="Gauge metric with count of processes." }
+request = "process.sql"
+
+[[metric]]
+context = "wait_time"
+metricsdesc = { value="Generic counter metric from v$waitclassmetric view in Oracle." }
+fieldtoappend= "wait_class"
+request = "wait_time.sql"
+
+[[metric]]
+context = "tablespace"
+labels = [ "tablespace", "type" ]
+metricsdesc = { bytes = "Generic counter metric of tablespaces bytes in Oracle.", max_bytes = "Generic counter metric of tablespaces max bytes in Oracle.", free = "Generic counter metric of tablespaces free bytes in Oracle." }
+request = "tablespace.sql"

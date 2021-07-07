@@ -1,3 +1,7 @@
+## 说明
+1. asm_diskgroup单节点下表不存在
+2. wait_time不存在
+
 # Oracle DB Exporter
 
 [![Build Status](https://travis-ci.org/iamseth/oracledb_exporter.svg)](https://travis-ci.org/iamseth/oracledb_exporter)

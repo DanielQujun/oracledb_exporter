@@ -4,20 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
+	"encoding/csv"
 	"errors"
 	"hash"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
-
-	_ "github.com/mattn/go-oci8"
 
 	"fmt"
 
@@ -42,12 +42,18 @@ var (
 	securedMetrics     = kingpin.Flag("web.secured-metrics", "Expose metrics using https.").Default("false").Bool()
 	serverCert         = kingpin.Flag("web.ssl-server-cert", "Path to the PEM encoded certificate").ExistingFile()
 	serverKey          = kingpin.Flag("web.ssl-server-key", "Path to the PEM encoded key").ExistingFile()
-)
+	oracleBin          = kingpin.Flag("oracle.bin", "oracle binary dir (env: ORACLE_BIN)").Default(getEnv("ORACLE_BIN", "")).String()
+	oracleBinName      = kingpin.Flag("oracle.binname", "oracle binary name (env: ORACLE_BIN_NAME)").Default(getEnv("ORACLE_BIN_NAME", "SQLPLUS.EXE")).String()
+	oracleDsn          = kingpin.Flag("oracle.dsn", "oracle connect dsn for sqlplus for example: system/manager@tidu. (env: ORACLE_DSN)").Default(getEnv("ORACLE_DSN", "system/manager@tidu")).String()
+	sqlDir             = kingpin.Flag("oracle.sqldir", "oracle sqls dir, default sqls (env: ORACLE_SQL_DIR)").Default(getEnv("ORACLE_BIN", "sqls")).String()
+
+	)
 
 // Metric name parts.
 const (
 	namespace = "oracledb"
 	exporter  = "exporter"
+	defaultTimeout = 5
 )
 
 // Metrics object description
@@ -74,6 +80,85 @@ var (
 	hashMap           map[int][]byte
 )
 
+type CsvTable struct {
+	FileName string
+	Records  []CsvRecord
+}
+
+type CsvRecord struct {
+	Record map[string]string
+}
+
+func readCSV(r io.Reader, query string, row int) *CsvTable {
+	var result = new(CsvTable)
+	reader := csv.NewReader(r)
+	if reader == nil {
+		log.Error("NewReader return nil, file:", query)
+		return result
+	}
+	records, err := reader.ReadAll()
+	if err != nil {
+		fmt.Println(err)
+		return result
+	}
+	if len(records) < row {
+		log.Error(query, " is empty")
+		return result
+	}
+	colNum := len(records[0])
+	recordNum := len(records)
+	var allRecords []CsvRecord
+	for i := row; i < recordNum; i++ {
+		record := &CsvRecord{make(map[string]string)}
+		for k := 0; k < colNum; k++ {
+			record.Record[records[0][k]] = records[i][k]
+		}
+		allRecords = append(allRecords, *record)
+	}
+	result = &CsvTable{
+		query,
+		allRecords,
+	}
+	return result
+}
+
+// DB to execute command
+type DB struct {
+	dsn           string
+	oracleBin     string
+	oracleBinName string
+}
+
+// runInWindows run oracle sql
+func (db *DB) runInWindows(cmd string) (string, error) {
+	fmt.Println("Running Win cmd:", cmd)
+	timeout, err := strconv.Atoi(*queryTimeout)
+	if err != nil {
+		log.Fatal("error while converting timeout option value: ", err)
+		panic(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	defer cancel()
+	result, err := exec.CommandContext(ctx, path.Join(db.oracleBin, db.oracleBinName), "-S", db.dsn, cmd).Output()
+
+	if err != nil {
+		log.Error(err)
+		return "", err
+	}
+	return strings.TrimSpace(string(result)), nil
+}
+
+// Ping Oracle DB to execute ping command
+func (db *DB) Ping() (string, error) {
+	sqlfile := path.Join(*sqlDir,"ping.sql")
+	return db.runInWindows(sqlfile)
+}
+
+// execute sql file
+func (db *DB) QueryContext(query string) (string, error) {
+	sqlfile := "@"+path.Join(*sqlDir, query)
+	return db.runInWindows(sqlfile)
+}
 // Exporter collects Oracle DB metrics. It implements prometheus.Collector.
 type Exporter struct {
 	dsn             string
@@ -81,7 +166,7 @@ type Exporter struct {
 	totalScrapes    prometheus.Counter
 	scrapeErrors    *prometheus.CounterVec
 	up              prometheus.Gauge
-	db              *sql.DB
+	db              *DB
 }
 
 // getEnv returns the value of an environment variable, or returns the provided fallback value
@@ -101,24 +186,12 @@ func atoi(stringValue string) int {
 	return intValue
 }
 
-func connect(dsn string) *sql.DB {
-	log.Debugln("Launching connection: ", dsn)
-	db, err := sql.Open("oci8", dsn)
-	if err != nil {
-		log.Errorln("Error while connecting to", dsn)
-		panic(err)
-	}
-	log.Debugln("set max idle connections to ", *maxIdleConns)
-	db.SetMaxIdleConns(*maxIdleConns)
-	log.Debugln("set max open connections to ", *maxOpenConns)
-	db.SetMaxOpenConns(*maxOpenConns)
-	log.Debugln("Successfully connected to: ", dsn)
-	return db
-}
-
 // NewExporter returns a new Oracle DB exporter for the provided DSN.
 func NewExporter(dsn string) *Exporter {
-	db := connect(dsn)
+	db := &DB{dsn: dsn,
+		oracleBinName: *oracleBinName,
+		oracleBin:     *oracleBin,
+	}
 	return &Exporter{
 		dsn: dsn,
 		duration: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -205,13 +278,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		}
 	}(time.Now())
 
-	if err = e.db.Ping(); err != nil {
-		if strings.Contains(err.Error(), "sql: database is closed") {
-			log.Infoln("Reconnecting to DB")
-			e.db = connect(e.dsn)
-		}
-	}
-	if err = e.db.Ping(); err != nil {
+	if _, err = e.db.Ping(); err != nil {
 		log.Errorln("Error pinging oracle:", err)
 		//e.db.Close()
 		e.up.Set(0)
@@ -295,7 +362,7 @@ func GetMetricType(metricType string, metricsType map[string]string) prometheus.
 }
 
 // interface method to call ScrapeGenericValues using Metric struct values
-func ScrapeMetric(db *sql.DB, ch chan<- prometheus.Metric, metricDefinition Metric) error {
+func ScrapeMetric(db *DB, ch chan<- prometheus.Metric, metricDefinition Metric) error {
 	log.Debugln("Calling function ScrapeGenericValues()")
 	return ScrapeGenericValues(db, ch, metricDefinition.Context, metricDefinition.Labels,
 		metricDefinition.MetricsDesc, metricDefinition.MetricsType, metricDefinition.MetricsBuckets,
@@ -304,11 +371,12 @@ func ScrapeMetric(db *sql.DB, ch chan<- prometheus.Metric, metricDefinition Metr
 }
 
 // generic method for retrieving metrics.
-func ScrapeGenericValues(db *sql.DB, ch chan<- prometheus.Metric, context string, labels []string,
+func ScrapeGenericValues(db *DB, ch chan<- prometheus.Metric, context string, labels []string,
 	metricsDesc map[string]string, metricsType map[string]string, metricsBuckets map[string]map[string]string, fieldToAppend string, ignoreZeroResult bool, request string) error {
 	metricsCount := 0
 	genericParser := func(row map[string]string) error {
 		// Construct labels value
+		log.Infof("got row %+v while parsing!!!!!",row)
 		labelsValues := []string{}
 		for _, label := range labels {
 			labelsValues = append(labelsValues, row[label])
@@ -409,57 +477,36 @@ func ScrapeGenericValues(db *sql.DB, ch chan<- prometheus.Metric, context string
 
 // inspired by https://kylewbanks.com/blog/query-result-to-map-in-golang
 // Parse SQL result and call parsing function to each row
-func GeneratePrometheusMetrics(db *sql.DB, parse func(row map[string]string) error, query string) error {
+func GeneratePrometheusMetrics(db *DB, parse func(row map[string]string) error, query string) error {
 
-	// Add a timeout
-	timeout, err := strconv.Atoi(*queryTimeout)
-	if err != nil {
-		log.Fatal("error while converting timeout option value: ", err)
-		panic(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
-	defer cancel()
-	rows, err := db.QueryContext(ctx, query)
-
-	if ctx.Err() == context.DeadlineExceeded {
+	rows, err := db.QueryContext(query)
+	if err == context.DeadlineExceeded {
 		return errors.New("Oracle query timed out")
 	}
-
-	if err != nil {
-		return err
-	}
-	cols, err := rows.Columns()
-	defer rows.Close()
-
-	for rows.Next() {
-		// Create a slice of interface{}'s to represent each column,
-		// and a second slice to contain pointers to each item in the columns slice.
-		columns := make([]interface{}, len(cols))
-		columnPointers := make([]interface{}, len(cols))
-		for i, _ := range columns {
-			columnPointers[i] = &columns[i]
+	r := strings.NewReader(rows)
+	csvtable := readCSV(r, query, 2)
+	if csvtable != nil && csvtable.Records != nil {
+		for num, row := range csvtable.Records {
+			rownum := num
+			m := make(map[string]string)
+			for colName, val := range row.Record {
+				if val != "" {
+					log.Infof("query: %s rownum %s: key: %s, value: %v", query, rownum,colName, val)
+					m[strings.ToLower(strings.TrimSpace(colName))] = strings.ToLower(strings.TrimSpace(val))
+				}else {
+					log.Infof("query: %s colName %s value is empty", query, colName)
+				}
+			}
+			// Call function to parse row
+			if err := parse(m); err != nil {
+				return err
+			}
 		}
-
-		// Scan the result into the column pointers...
-		if err := rows.Scan(columnPointers...); err != nil {
-			return err
-		}
-
-		// Create our map, and retrieve the value for each column from the pointers slice,
-		// storing it in the map with the name of the column as the key.
-		m := make(map[string]string)
-		for i, colName := range cols {
-			val := columnPointers[i].(*interface{})
-			m[strings.ToLower(colName)] = fmt.Sprintf("%v", *val)
-		}
-		// Call function to parse row
-		if err := parse(m); err != nil {
-			return err
-		}
+	} else {
+		log.Warnf("read query %s csvtable empty!",query)
 	}
 
 	return nil
-
 }
 
 // Oracle gives us some ugly names back. This function cleans things up for Prometheus.
@@ -541,18 +588,17 @@ func main() {
 	kingpin.Parse()
 
 	log.Infoln("Starting oracledb_exporter " + Version)
-	dsn := os.Getenv("DATA_SOURCE_NAME")
 
 	// Load default and custom metrics
 	hashMap = make(map[int][]byte)
 	reloadMetrics()
 
-	exporter := NewExporter(dsn)
+	exporter := NewExporter(*oracleDsn)
 	prometheus.MustRegister(exporter)
 
 	// See more info on https://github.com/prometheus/client_golang/blob/master/prometheus/promhttp/http.go#L269
 	opts := promhttp.HandlerOpts{
-		ErrorLog: log.NewErrorLogger(),
+		ErrorLog:      log.NewErrorLogger(),
 		ErrorHandling: promhttp.ContinueOnError,
 	}
 	http.Handle(*metricPath, promhttp.HandlerFor(prometheus.DefaultGatherer, opts))
